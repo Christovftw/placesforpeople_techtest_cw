@@ -3,9 +3,7 @@
 Before taking any action in this project, agents MUST:
 
 1. Read the following files in this folder and keep their contents in mind while working:
-   - `planning.md`
    - `README.md`
-   - `todo.md`
 
 2. Do not make code changes unless explicitly instructed to do so.
 

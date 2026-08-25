@@ -8,7 +8,6 @@ on:
 permissions:
   id-token: write # required for AWS OIDC federation when a deploy role is configured
   contents: read
-  pull-requests: write # required to read the plan comment left on pull requests
 
 env:
   AWS_REGION: eu-north-1

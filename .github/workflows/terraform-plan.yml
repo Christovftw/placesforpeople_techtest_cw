@@ -5,6 +5,7 @@ on:
     paths:
       - "infrastructure/**"
       - ".github/workflows/terraform-plan.yml"
+      - ".github/workflows/terraform-deploy.yml"
 
 permissions:
   id-token: write # required for AWS OIDC federation when a deploy role is configured

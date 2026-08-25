@@ -1,0 +1,127 @@
+name: Terraform Plan
+
+on:
+  pull_request:
+    paths:
+      - "infrastructure/**"
+      - ".github/workflows/terraform-plan.yml"
+
+permissions:
+  id-token: write # required for AWS OIDC federation when a deploy role is configured
+  contents: read
+  pull-requests: write # required to comment on the pull request
+
+env:
+  AWS_REGION: eu-north-1
+  ECR_REPOSITORY: du-university-chapters-etl
+
+concurrency:
+  group: terraform-plan-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      # Try to use OIDC to authenticate
+      - name: Configure AWS credentials via OIDC
+        if: vars.AWS_DEPLOY_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # If OIDC doesn't work, then use static keys
+      - name: Configure AWS credentials via static keys
+        if: vars.AWS_DEPLOY_ROLE_ARN == ''
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+
+      - name: Resolve the deployed image URI
+        run: |
+          account_id=$(aws sts get-caller-identity --query Account --output text)
+          echo "IMAGE_URI=${account_id}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:latest" >> "$GITHUB_ENV"
+
+      - name: Terraform init
+        working-directory: infrastructure
+        run: terraform init -input=false
+
+      - name: Terraform validate
+        working-directory: infrastructure
+        run: terraform validate -no-color
+
+      - name: Terraform plan
+        id: plan
+        working-directory: infrastructure
+        run: terraform plan -no-color -input=false -detailed-exitcode -var="image_uri=${IMAGE_URI}"
+        continue-on-error: true
+
+      - name: Post the plan as a pull request comment
+        uses: actions/github-script@v9
+        if: always() && github.event_name == 'pull_request'
+        env:
+          PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
+          EXITCODE: ${{ steps.plan.outputs.exitcode }}
+        with:
+          script: |
+            const exitcode = process.env.EXITCODE;
+            const status = exitcode === '0'
+              ? 'no changes'
+              : exitcode === '2'
+                ? 'changes detected'
+                : 'failed';
+
+            let plan = process.env.PLAN || '';
+            if (plan.length > 55000) {
+              plan = plan.slice(0, 55000) + '\n\n... (output truncated, see the workflow logs for the full plan)';
+            }
+
+            const body = `#### Terraform plan: ${status}
+
+            <details><summary>Show plan</summary>
+
+            \`\`\`hcl
+            ${plan}
+            \`\`\`
+
+            </details>
+
+            *Triggered by @${{ github.actor }}, workflow: \`${{ github.workflow }}\`*`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const marker = '#### Terraform plan:';
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Fail the job if the plan errored
+        if: steps.plan.outputs.exitcode == '1'
+        run: exit 1

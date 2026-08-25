@@ -1,0 +1,44 @@
+name: Code Health
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: du_chapters
+          POSTGRES_USER: etl
+          POSTGRES_PASSWORD: etl
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U etl -d du_chapters"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run the linter
+        run: ruff check .
+
+      - name: Run the test suite
+        run: pytest tests/ -v

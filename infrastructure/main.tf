@@ -103,6 +103,26 @@ resource "aws_iam_role_policy" "lambda_secrets_manager" {
   })
 }
 
+resource "aws_iam_role_policy" "lambda_ecr_pull" {
+  name = "${local.name_prefix}-ecr-pull"
+  role = aws_iam_role.lambda_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "ecr:BatchGetImage",
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchCheckLayerAvailability"
+        ]
+        Resource = aws_ecr_repository.etl.arn
+      }
+    ]
+  })
+}
+
 resource "random_password" "db_password" {
   length  = 32
   special = false
@@ -204,6 +224,7 @@ resource "aws_lambda_function" "etl" {
   depends_on = [
     aws_iam_role_policy_attachment.lambda_basic_execution,
     aws_iam_role_policy.lambda_secrets_manager,
+    aws_iam_role_policy.lambda_ecr_pull,
     aws_cloudwatch_log_group.etl,
     aws_secretsmanager_secret_version.db_credentials,
   ]

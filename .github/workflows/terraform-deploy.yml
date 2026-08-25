@@ -6,8 +6,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  id-token: write # required for AWS OIDC federation
+  id-token: write # required for AWS OIDC federation when a deploy role is configured
   contents: read
+  pull-requests: write # required to read the plan comment left on pull requests
 
 env:
   AWS_REGION: eu-north-1
@@ -20,11 +21,22 @@ jobs:
     steps:
       - name: Check out the repository
         uses: actions/checkout@v7
-
+      
+      # Try to use OIDC to authenticate
       - name: Configure AWS credentials via OIDC
+        if: vars.AWS_DEPLOY_ROLE_ARN != ''
         uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # If OIDC doesn't work, then use static keys
+      - name: Configure AWS credentials via static keys
+        if: vars.AWS_DEPLOY_ROLE_ARN == ''
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Set up Terraform

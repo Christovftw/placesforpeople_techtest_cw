@@ -67,7 +67,7 @@ jobs:
         continue-on-error: true
 
       - name: Post the plan as a pull request comment
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         if: always() && github.event_name == 'pull_request'
         env:
           PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"

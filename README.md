@@ -114,11 +114,24 @@ For AWS deployments, set `DB_SECRET_ARN` to the ARN of a secret in Secrets Manag
 
 When `DB_SECRET_ARN` is set, the pipeline fetches connection details from Secrets Manager at runtime. Any keys present in the secret override the corresponding environment variables (`POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`). For local development, leave `DB_SECRET_ARN` unset and use the `POSTGRES_*` environment variables instead.
 
-## AWS deployment note
+## AWS deployment
 
-The Terraform infrastructure will deploy the ETL as a Lambda container image, create a small RDS Postgres instance, and schedule the function daily via EventBridge Scheduler. The current local setup uses a shared Docker network for simplicity; the AWS deployment uses a publicly accessible RDS instance to keep costs low. This is a cost-conscious demo pattern and is **not** a full production network design.
+The Terraform infrastructure deploys the ETL as a Lambda container image, creates a small RDS Postgres instance, and schedules the function daily via EventBridge Scheduler. The current local setup uses a shared Docker network for simplicity; the AWS deployment uses a publicly accessible RDS instance to keep costs low. This is a cost-conscious demo pattern and is **not** a full production network design.
 
 To deploy this project you need an AWS account and a user/role with sufficient permissions to create ECR, Lambda, RDS, Secrets Manager, CloudWatch, EventBridge Scheduler, SNS and IAM resources. Terraform state is stored in an S3 backend configured in `infrastructure/backend.tf`. The bucket name is a literal value in that file — Terraform backend blocks cannot reference variables — and the bucket must exist before running `terraform init`. State is encrypted at rest (`encrypt = true`) and uses the S3 lockfile for state locking (`use_lockfile = true`).
+
+### Prerequisite: create the Terraform state bucket (one-time, required for all deploys)
+
+Both local deploys and the CI/CD pipeline run `terraform init` against the same S3 backend, so the state bucket must be created once, up front, before either will work:
+
+```bash
+aws s3api create-bucket --bucket techtest-p4p-cw --region eu-north-1 \
+  --create-bucket-configuration LocationConstraint=eu-north-1
+aws s3api put-bucket-versioning --bucket techtest-p4p-cw \
+  --versioning-configuration Status=Enabled
+```
+
+Public access is blocked and encryption is on by default; versioning is recommended so previous state files can be recovered.
 
 ### RDS public access warning (demo only)
 
@@ -129,29 +142,34 @@ Because the Lambda function runs outside the VPC, its outbound connections to th
 
 Even with those protections, exposing port 5432 to the entire internet would **not** be acceptable in production. The production pattern is Lambda attached to private subnets reaching RDS via security-group-to-security-group rules, with a NAT Gateway or VPC endpoints for egress.
 
-### Bootstrapping: Terraform and the ECR image URI (first deploy)
+### Bootstrapping: Terraform and the ECR image URI (local deploy)
+
+This assumes the state bucket has been created (see above) and that your local AWS credentials have permission to create the resources in the stack.
 
 The Lambda resource requires the container image to already exist in ECR, but the ECR repository is created by the same `terraform apply` — a chicken-and-egg problem. The repository URL also cannot be known in advance because it contains the AWS account ID: `<account-id>.dkr.ecr.<region>.amazonaws.com/du-university-chapters-etl`. The clean workaround is a targeted first apply — do **not** let a full `apply` fail just to discover the URL, as that leaves the stack half-created for no benefit:
 
 ```bash
 cd infrastructure
 
-# 1. Create only the ECR repository
+# 1. Initialise Terraform against the S3 backend
+terraform init
+
+# 2. Create only the ECR repository
 terraform apply -target=aws_ecr_repository.etl
 
-# 2. Read the generated repository URL
+# 3. Read the generated repository URL
 terraform output ecr_repository_url
 
-# 3. Build and push the image (run from the repository root)
+# 4. Build and push the image (run from the repository root)
 cd ../
 aws ecr get-login-password --region eu-north-1 | \
   docker login --username AWS --password-stdin <repository-url>
 docker buildx build --platform linux/amd64 --provenance=false -t <repository-url>:latest --push .
 
-# 4. Set the terraform.tfvars variable `image_uri` with the correct value, replacing the placeholder
+# 5. Set the terraform.tfvars variable `image_uri` with the correct value, replacing the placeholder
 image_uri = "123456789012.dkr.ecr.eu-north-1.amazonaws.com/du-university-chapters-etl"
 
-# 5. Apply the full stack with the real image URI from the infrastructure/ directory
+# 6. Apply the full stack with the real image URI from the infrastructure/ directory
 cd infrastructure
 terraform apply
 ```
@@ -162,23 +180,40 @@ This bootstrap is only needed once: the repository persists across deploys, so l
 
 GitHub Actions workflows live in `.github/workflows/`:
 
-- `ci.yml` — on pull requests and pushes to `main`: lints with `ruff check .` and runs the test suite against a Postgres 16 service container.
-- `deploy.yml` — on pushes to `main` (and manual dispatch): authenticates to AWS via OIDC (no long-lived keys), ensures the ECR repository exists, builds and pushes the image tagged with the Git SHA, then runs `terraform apply` with the new image URI.
+- `code-health.yml` — on pull requests: lints with `ruff check .` and runs the test suite against a Postgres 16 service container.
+- `terraform-plan.yml` — on pull requests that change `infrastructure/`: runs `terraform plan` and posts the plan as a (single, updated) comment on the pull request so reviewers can see the infrastructure diff before merge.
+- `terraform-deploy.yml` — on pushes to `main` (and manual dispatch): authenticates to AWS, ensures the ECR repository exists, builds and pushes the image tagged with the Git SHA, then runs `terraform apply` with the new image URI.
+
+The AWS workflows authenticate using an IAM user's static access keys stored as GitHub secrets. OIDC role assumption (no long-lived keys) is the preferred production pattern — see the note below for why it is not used here and what would change.
 
 ### Bootstrapping: GitHub Actions CI/CD (one-time AWS setup)
 
-The deploy workflow authenticates via OIDC and requires four one-time setup steps in the AWS account:
+As well as the shared Terraform state bucket created above, the deploy and plan workflows need AWS credentials. The setup steps are:
 
-1. **Create the S3 state bucket** (must exist before any `terraform init`; public access is blocked and encryption is on by default, and versioning is recommended for state recovery):
+1. **Create a dedicated CI user, a customer-managed policy and an access key** (`aws-policy.json` in this repository grants the least-privilege permissions the workflows need — Terraform state, ECR, Lambda, IAM, EventBridge Scheduler, CloudWatch, SNS, Secrets Manager, RDS and EC2):
 
    ```bash
-   aws s3api create-bucket --bucket techtest-p4p-cw --region eu-north-1 \
-     --create-bucket-configuration LocationConstraint=eu-north-1
-   aws s3api put-bucket-versioning --bucket techtest-p4p-cw \
-     --versioning-configuration Status=Enabled
+   aws iam create-user --user-name terraform_user
+   aws iam create-policy --policy-name du-etl-deploy \
+     --policy-document file://aws-policy.json
+   aws iam attach-user-policy --user-name terraform_user \
+     --policy-arn arn:aws:iam::<account-id>:policy/du-etl-deploy
+   aws iam create-access-key --user-name terraform_user
    ```
 
-2. **Create the IAM OIDC identity provider** (once per AWS account; no certificate thumbprint is needed — AWS validates it automatically):
+   The policy must be a customer-managed policy, not an inline user policy: inline policies are limited to 2,048 characters and this one exceeds that. To update it later, create a new policy version (`aws iam create-policy-version --policy-arn ... --policy-document file://aws-policy.json --set-as-default`) or edit it in the IAM console. To avoid formatting-related size issues when pasting into the console, save a minified copy first (for example `jq -c . aws-policy.json > aws-policy.min.json`) and paste that.
+
+2. **Set the GitHub repository secrets** `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` to the access key created above (*Settings → Secrets and variables → Actions → Secrets*).
+
+Once these are in place, a push to `main` (or *Actions → Terraform Deploy → Run workflow*) runs the full deploy. No ECR bootstrap is needed from CI/CD: `terraform-deploy.yml` creates the repository with a targeted apply, pushes the image tagged with the Git SHA, and then applies the full stack with that image URI. Delete the CI user, its access key and the `du-etl-deploy` policy once the deployment is no longer needed.
+
+### Authentication note: static keys vs OIDC (production pattern)
+
+The workflows use a long-lived access key for a dedicated IAM user because the AWS account used for this demo sits inside an AWS Organization whose service control policy explicitly denies `iam:CreateOpenIDConnectProvider`, so the GitHub Actions OIDC identity provider cannot be created in that account.
+
+The pipelines already support the production pattern: both `terraform-deploy.yml` and `terraform-plan.yml` attempt OIDC first (assuming the role in the `AWS_DEPLOY_ROLE_ARN` repository variable) and fall back to the static-key secrets only when that variable is unset. Migrating to OIDC requires the three one-time AWS steps below and no workflow changes:
+
+1. **Create the IAM OIDC identity provider** (once per AWS account; no certificate thumbprint is needed — AWS validates it automatically):
 
    ```bash
    aws iam create-open-id-connect-provider \
@@ -186,7 +221,7 @@ The deploy workflow authenticates via OIDC and requires four one-time setup step
      --client-id-list sts.amazonaws.com
    ```
 
-3. **Create the IAM deploy role** the workflow assumes: trusted entity type *Web identity* for that provider, audience `sts.amazonaws.com`, and a trust policy condition scoping the subject to this repository:
+2. **Create the IAM deploy role** the workflow assumes: trusted entity type *Web identity* for that provider, audience `sts.amazonaws.com`, and a trust policy condition scoping the subject to this repository:
 
    ```json
    "Condition": {
@@ -195,11 +230,11 @@ The deploy workflow authenticates via OIDC and requires four one-time setup step
    }
    ```
 
-   Use `StringLike` with a trailing `:*` so the condition covers the `sub` claim formats emitted by both older and newer repositories (repositories created after mid-July 2026 can include `@<org-id>`/`@<repo-id>` suffixes). Avoid naming the role `GitHubActions`, which is a known issue with the `configure-aws-credentials` action. For the demo, `PowerUserAccess` + `IAMFullAccess` is pragmatic (Terraform creates IAM roles, which `PowerUserAccess` excludes); production should use a least-privilege policy covering ECR, Lambda, RDS, Secrets Manager, CloudWatch, EventBridge Scheduler, SNS, EC2, IAM pass-role and the S3 state bucket.
+   Use `StringLike` with a trailing `:*` so the condition covers the `sub` claim formats emitted by both older and newer repositories (repositories created after mid-July 2026 can include `@<org-id>`/`@<repo-id>` suffixes). Avoid naming the role `GitHubActions`, which is a known issue with the `configure-aws-credentials` action. The role should carry a least-privilege policy equivalent to `aws-policy.json` plus `iam:CreateServiceLinkedRole`; for the demo, `PowerUserAccess` + `IAMFullAccess` is a pragmatic alternative (Terraform creates IAM roles, which `PowerUserAccess` excludes).
 
-4. **Set the GitHub repository variable** `AWS_DEPLOY_ROLE_ARN` to the role ARN (*Settings → Secrets and variables → Actions → Variables*).
+3. **Set the GitHub repository variable** `AWS_DEPLOY_ROLE_ARN` to the role ARN (*Settings → Secrets and variables → Actions → Variables*).
 
-Once these are in place, a push to `main` (or *Actions → Deploy → Run workflow*) runs the full deploy, including the ECR bootstrap above.
+Once the OIDC provider and role exist and the variable is set, the workflows automatically stop using the static keys, and the CI user can be deleted.
 
 ## Notes
 
@@ -208,3 +243,4 @@ Once these are in place, a push to `main` (or *Actions → Deploy → Run workfl
 - The shim in `__main__.py` is there for brevity, it could in theory be removed but it makes the pipeline easier to invoke locally with `python -m etl` in the virtual environment.
 - The Secrets Manager secret created by Terraform is configured with `recovery_window_in_days = 0`, meaning it is permanently deleted immediately on `terraform destroy` with no recovery window. This has been done deliberately for the purposes of this demo so that `terraform destroy` tears everything down cleanly and the secret name can be reused on re-deploy. In a production deployment this would not be acceptable.
 - The Lambda failure alarm publishes to an SNS topic that deliberately has no subscriptions in this demo. In a production environment you would subscribe to the topic (for example email or Slack) to get alerts on failures, or use an external monitoring platform such as Datadog that integrates with the wider corporate structure.
+- The Lambda function can fail to deploy initially if the postgres database takes too long to deploy. This happened once during final testing but is easily resolved by re-running the deployment pipeline.

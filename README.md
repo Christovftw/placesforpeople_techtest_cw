@@ -244,3 +244,13 @@ Once the OIDC provider and role exist and the variable is set, the workflows aut
 - The Secrets Manager secret created by Terraform is configured with `recovery_window_in_days = 0`, meaning it is permanently deleted immediately on `terraform destroy` with no recovery window. This has been done deliberately for the purposes of this demo so that `terraform destroy` tears everything down cleanly and the secret name can be reused on re-deploy. In a production deployment this would not be acceptable.
 - The Lambda failure alarm publishes to an SNS topic that deliberately has no subscriptions in this demo. In a production environment you would subscribe to the topic (for example email or Slack) to get alerts on failures, or use an external monitoring platform such as Datadog that integrates with the wider corporate structure.
 - The Lambda function can fail to deploy initially if the postgres database takes too long to deploy. This happened once during final testing but is easily resolved by re-running the deployment pipeline.
+
+
+## Future Thoughts
+Some thoughts on other developments that could be done that aren't called out anywhere else above.  
+
+- The deployment and plan pipelines could be combined into one pipeline that triggers for more actions but only enables certain parts of the pipeline, this means less code to manage and less duplication when dealing with an enterprise scale.
+- The build and push of the docker container could be refined to only build and push when a change is made, comparing files in the `/etl` folder.
+- Data quality checks could be improved, currently we don't deal with potentially deleted records from the API
+- Introducing a `pyproject.toml` and using an environment manager like poetry or uv could be beneficial as the codebase grows.
+- Introducing typing and checking with mypy and formatting enhancement. Also introducing security checks like bandit and/or some external security scanning software suite like sonatype.

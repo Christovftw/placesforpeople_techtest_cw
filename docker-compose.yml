@@ -1,0 +1,22 @@
+services:
+  etl:
+    build: .
+    environment:
+      POSTGRES_HOST: db # will connect to the local postgres docker compose in local_postgres/ - it must be running first. This avoids potential local postgres db container conflicts
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      SOURCE_URL: ${SOURCE_URL}
+      TARGET_STATES: ${TARGET_STATES}
+      ARCGIS_PAGE_SIZE: ${ARCGIS_PAGE_SIZE}
+      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT}
+      LOG_LEVEL: ${LOG_LEVEL}
+    networks:
+      - du-postgres
+    entrypoint: ["python"]
+    command: ["-m", "etl"]
+
+networks:
+  du-postgres:
+    external: true

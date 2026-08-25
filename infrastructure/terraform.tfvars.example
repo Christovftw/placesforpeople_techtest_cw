@@ -1,0 +1,4 @@
+aws_region   = "eu-north-1"
+image_uri    = "123456789012.dkr.ecr.eu-north-1.amazonaws.com/du-university-chapters-etl"
+db_name      = "du_chapters"
+db_username  = "etl"
